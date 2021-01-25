@@ -56,6 +56,9 @@
 #include "lwip/autoip.h"
 #include "lwip/stats.h"
 #include "lwip/prot/dhcp.h"
+#ifdef CONFIG_IP_ROUTING
+#include "lwip/ip4_route.h"
+#endif
 
 #include <string.h>
 
@@ -140,6 +143,37 @@ bool ip4_netif_exist(const ip4_addr_t *src, const ip4_addr_t *dest)
   return false;
 }
 
+#ifdef CONFIG_IP_ROUTING
+static struct ip4_route ip4_routes[CONFIG_IP_ROUTING_TABLE_SIZE];
+
+int ESP_IRAM_ATTR
+ip4_route_find(const ip4_addr_t *dest)
+{
+  int i,imax=-1,max=0;
+  LWIP_DEBUGF(IP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("ip4_route_find: route to %"U16_F".%"U16_F".%"U16_F".%"U16_F"\n",
+      ip4_addr1_16(dest), ip4_addr2_16(dest), ip4_addr3_16(dest), ip4_addr4_16(dest)));
+  if (dest) {
+    for (i = 0 ; i < CONFIG_IP_ROUTING_TABLE_SIZE ; i++) {
+      int mlen=ip4_routes[i].prefixlen;
+      unsigned int mask=0xffffffff;
+      mask=mlen ? htonl(mask << (32-mlen)) : 0;
+#if 0
+      LWIP_DEBUGF(IP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("compare %"X32_F"/%d %"X32_F" = %"X32_F" with %"X32_F"\n",
+		  dest->addr,mlen,mask,dest->addr & mask,ip4_routes[i].dest.addr
+		));
+#endif
+
+      if (ip4_routes[i].valid && (dest->addr & mask) == ip4_routes[i].dest.addr && mlen > max) {
+       LWIP_DEBUGF(IP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("ip4_route_find: route %d mask %d  %"U16_F".%"U16_F".%"U16_F".%"U16_F"\n",
+        i,mlen,ip4_addr1_16(&ip4_routes[i].dest), ip4_addr2_16(&ip4_routes[i].dest), ip4_addr3_16(&ip4_routes[i].dest), ip4_addr4_16(&ip4_routes[i].dest)));
+        max=mlen;
+        imax=i;
+      }
+    }
+  }
+  return imax;
+}
+
 /**
  * Source based IPv4 routing hook function. 
  */
@@ -162,8 +196,70 @@ ip4_route_src_hook(const ip4_addr_t *dest, const ip4_addr_t *src)
       }
     }
   }
+  int route=ip4_route_find(dest);
+  if (route != -1) {
+    int ifidx=1-ip4_routes[route].iface;
+    netif=netif_list;
+    while (netif && ifidx > 0) { 
+      ifidx--;
+      netif=netif->next;
+    }
+    if (netif) {
+      LWIP_DEBUGF(IP_DEBUG, ("ip4_route_gw_hook: %c%c\n", netif->name[0], netif->name[1]));
+    }
+  }
   return netif;
 }
+
+ip4_addr_t * ESP_IRAM_ATTR
+ip4_route_gw_hook(struct netif *netif, const ip4_addr_t *dest)
+{
+  int route=ip4_route_find(dest);
+  if (route == -1)
+    return NULL;
+  return &ip4_routes[route].nexthop;
+}
+
+void
+ip4_route_add(const struct ip4_route *route)
+{
+  int i;
+  for (i = 0 ; i < CONFIG_IP_ROUTING_TABLE_SIZE ; i++) {
+     if (!ip4_routes[i].valid) {
+	ip4_routes[i]=*route;
+	ip4_routes[i].valid=1;
+	return;
+     }
+  }
+}
+
+void
+ip4_route_delete(const struct ip4_route *route)
+{ 
+  int i;
+  for (i = 0 ; i < CONFIG_IP_ROUTING_TABLE_SIZE ; i++) {
+     if (ip4_routes[i].valid && ip4_routes[i].dest.addr == route->dest.addr && ip4_routes[i].nexthop.addr == route->nexthop.addr &&
+         ip4_routes[i].prefixlen == route->prefixlen && ip4_routes[i].iface == route->iface) {
+	ip4_routes[i].valid=0;
+     }
+  }
+}
+
+int
+ip4_route_getlen(void)
+{
+  return CONFIG_IP_ROUTING_TABLE_SIZE;
+}
+
+const struct ip4_route *
+ip4_route_get(int idx)
+{
+  if (idx < 0 || idx >= CONFIG_IP_ROUTING_TABLE_SIZE || !ip4_routes[idx].valid)
+    return NULL;
+  return &ip4_routes[idx];
+}
+#endif
+
 #endif
 
 /**
@@ -178,10 +274,12 @@ struct netif *
 ip4_route_src(const ip4_addr_t *dest, const ip4_addr_t *src)
 {
   if (src != NULL) {
+#ifndef CONFIG_IP_ROUTING
 #if ESP_LWIP
     if (!ip4_addr_isany(src) && (ip4_netif_exist(src,dest) == false)) {
       return NULL;
     }
+#endif
 #endif
     /* when src==NULL, the hook is called from ip4_route(dest) */
     struct netif *netif = LWIP_HOOK_IP4_ROUTE_SRC(dest, src);
